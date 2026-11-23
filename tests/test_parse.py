@@ -9,12 +9,14 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import push_trending  # noqa: E402
 from push_trending import (  # noqa: E402
+    Repo,
     language_list,
     localize_repos,
     needs_translation,
     parse_gtx,
     parse_repos,
     render_messages,
+    scenario_source,
     trending_link,
 )
 
@@ -53,14 +55,54 @@ class ParseTrendingTest(unittest.TestCase):
         self.assertEqual(parse_gtx(payload), "用来做小组件。")
 
         original = push_trending.translate_to_zh
+        original_readme = push_trending.fetch_readme
         push_trending.translate_to_zh = lambda text: "中文介绍"
+        push_trending.fetch_readme = lambda name: ""
         try:
             page = (ROOT / "tests" / "fixture.html").read_text(encoding="utf-8")
             repos = localize_repos(parse_repos(page)[:1])
         finally:
             push_trending.translate_to_zh = original
+            push_trending.fetch_readme = original_readme
         self.assertEqual(repos[0].description, "中文介绍")
         self.assertEqual(repos[0].name, "acme/widgets")
+        self.assertEqual(repos[0].scenario, "")
+
+    def test_scenario_comes_from_use_cases(self) -> None:
+        readme = """
+# Widgets
+
+Build widgets and ship faster.
+
+## Use cases
+
+Review a pull request before merging it into the main branch.
+Share a release checklist with the team when shipping.
+
+## Install
+
+```bash
+pip install widgets
+```
+"""
+        source = scenario_source(readme, "Build widgets and ship faster.")
+        self.assertIn("pull request", source)
+        self.assertNotIn("pip install", source)
+
+        when = datetime(2026, 11, 23, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        repo = Repo(
+            name="acme/widgets",
+            url="https://github.com/acme/widgets",
+            description="做小组件。",
+            language="Python",
+            stars=10,
+            forks=1,
+            gained=2,
+            period="week",
+            scenario="合并代码前先检查改动，并发给同事一起看。",
+        )
+        text = "\n".join(render_messages("", [repo], when))
+        self.assertIn("场景：合并代码前先检查改动，并发给同事一起看。", text)
 
     def test_language_helpers(self) -> None:
         self.assertEqual(language_list(None), [""])

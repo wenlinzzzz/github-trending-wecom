@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  models: read
 
 jobs:
   push:
@@ -22,6 +23,7 @@ jobs:
       - name: Push weekly trending to WeCom
         env:
           WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+          GITHUB_TOKEN: ${{ github.token }}
           LANGUAGES: ${{ vars.LANGUAGES }}
           TOP_N: ${{ vars.TOP_N }}
         run: python scripts/push_trending.py

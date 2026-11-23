@@ -63,6 +63,7 @@ class Repo:
     forks: int | None
     gained: int | None
     period: str
+    scenario: str = ""
 
 
 def clean_text(value: str, limit: int = 160) -> str:
@@ -258,24 +259,214 @@ def translate_to_zh(text: str) -> str:
         return text
 
 
+CODE_FENCE_RE = re.compile(r"```[\s\S]*?```")
+HEADING_RE = re.compile(r"(?m)^(#{1,3})\s+(.+?)\s*$")
+COMMAND_RE = re.compile(
+    r"^(npm|pnpm|yarn|pip|pip3|cargo|git|curl|wget|cd|sudo|docker|brew|go|python3?)\b",
+    re.IGNORECASE,
+)
+PREFERRED_HEADING_RE = re.compile(
+    r"use case|usage|when to|feature|what |why |overview|intro|scenario|example|"
+    r"使用|场景|功能|特性|简介|能做",
+    re.IGNORECASE,
+)
+SKIP_HEADING_RE = re.compile(
+    r"install|contribut|license|changelog|table of contents|badge|sponsor|"
+    r"安装|协议|许可|贡献|更新日志|目录",
+    re.IGNORECASE,
+)
+MODEL_URLS = (
+    "https://models.github.ai/inference/chat/completions",
+    "https://models.inference.ai.azure.com/chat/completions",
+)
+MODEL_NAME = "openai/gpt-4o-mini"
+_model_unavailable = False
+
+
+def prose_from_markdown(body: str) -> str:
+    body = CODE_FENCE_RE.sub("\n", body)
+    body = re.sub(r"<!--[\s\S]*?-->", " ", body)
+    lines: list[str] = []
+    for raw in body.splitlines():
+        line = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", raw)
+        line = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", line)
+        line = re.sub(r"<[^>]+>", "", line)
+        line = re.sub(r"^#{1,6}\s*", "", line.strip())
+        line = re.sub(r"^[-*+]\s+", "", line)
+        line = re.sub(r"^\d+\.\s+", "", line)
+        line = line.strip(" \t>|`")
+        if not line or set(line) <= {"-", "=", "*", "_"}:
+            continue
+        if COMMAND_RE.match(line):
+            continue
+        if line.count(" ") < 2 and len(line) < 48:
+            continue
+        lines.append(line)
+    return clean_text(" ".join(lines), limit=500)
+
+
+def _normalized(text: str) -> str:
+    return re.sub(r"[\W_]+", "", text.lower(), flags=re.UNICODE)
+
+
+def adds_detail(detail: str, brief: str) -> bool:
+    longer = _normalized(detail)
+    shorter = _normalized(brief)
+    if len(longer) < 20:
+        return False
+    if not shorter:
+        return True
+    if longer in shorter:
+        return False
+    return len(longer.replace(shorter, "")) >= 24
+
+
+def scenario_source(readme: str, description: str) -> str:
+    if not readme.strip():
+        return ""
+    matches = list(HEADING_RE.finditer(readme))
+    chunks: list[tuple[int, str]] = []
+    bounds = [match.start() for match in matches] + [len(readme)]
+    starts = [0] + [match.end() for match in matches]
+    titles = [""] + [match.group(2).strip() for match in matches]
+    for title, start, end in zip(titles, starts, bounds):
+        text = prose_from_markdown(readme[start:end])
+        if len(_normalized(text)) < 20:
+            continue
+        if title and SKIP_HEADING_RE.search(title):
+            rank = 2
+        elif title and PREFERRED_HEADING_RE.search(title):
+            rank = 0
+        else:
+            rank = 1
+        chunks.append((rank, text))
+    if not chunks:
+        return ""
+    chunks.sort(key=lambda item: item[0])
+    for _, text in chunks:
+        if adds_detail(text, description):
+            return text
+    return ""
+
+
+def fetch_readme(name: str) -> str:
+    urls = [
+        f"https://api.github.com/repos/{name}/readme",
+        f"https://raw.githubusercontent.com/{name}/HEAD/README.md",
+    ]
+    last_error: Exception | None = None
+    for url in urls:
+        headers = {"User-Agent": USER_AGENT}
+        if "api.github.com" in url:
+            headers["Accept"] = "application/vnd.github.raw+json"
+        request = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                return response.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if exc.code == 404:
+                continue
+        except (OSError, urllib.error.URLError, http.client.HTTPException, TimeoutError) as exc:
+            last_error = exc
+    if last_error and not isinstance(last_error, urllib.error.HTTPError):
+        print(f"读取 README 失败 {name}：{last_error}", file=sys.stderr)
+    return ""
+
+
+def tidy_scenario(text: str) -> str:
+    text = clean_text(text, limit=140)
+    return re.sub(r"^(场景|介绍|总结)[:：]\s*", "", text).strip()
+
+
+def github_model_scenario(name: str, description: str, source: str) -> str:
+    global _model_unavailable
+    if _model_unavailable:
+        raise RuntimeError("场景模型不可用")
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("没有 GITHUB_TOKEN")
+    prompt = (
+        "你在给不懂英文的同事介绍一个 GitHub 项目。"
+        "根据材料，用中文写两句短话：它具体解决什么问题，以及什么人在什么情况下会用。"
+        "不要写仓库名，不要写“本项目”，不要空话，不要列表，总共不超过 90 个字。\n\n"
+        f"仓库：{name}\n简介：{description or '无'}\n说明摘录：{source or '无'}"
+    )
+    payload = {
+        "model": MODEL_NAME,
+        "temperature": 0.2,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    body = json.dumps(payload).encode("utf-8")
+    last_error: Exception | None = None
+    for url in MODEL_URLS:
+        request = urllib.request.Request(
+            url,
+            data=body,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Accept": "application/vnd.github+json",
+                "User-Agent": USER_AGENT,
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=40) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            content = data["choices"][0]["message"]["content"]
+            text = tidy_scenario(str(content))
+            if text:
+                return text
+            raise RuntimeError("模型没有返回场景")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:180]
+            last_error = RuntimeError(f"{exc.code} {detail}")
+            if exc.code in {401, 403, 404}:
+                continue
+        except (OSError, urllib.error.URLError, http.client.HTTPException, TimeoutError, KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+            last_error = exc
+    _model_unavailable = True
+    raise RuntimeError(str(last_error or "场景模型不可用"))
+
+
+def explain_scenario(name: str, description: str, source: str) -> str:
+    if not source and not description:
+        return ""
+    if os.environ.get("GITHUB_TOKEN", "").strip() and not _model_unavailable:
+        try:
+            return github_model_scenario(name, description, source)
+        except (OSError, urllib.error.URLError, http.client.HTTPException, TimeoutError, RuntimeError, KeyError, IndexError, TypeError, json.JSONDecodeError, ValueError) as exc:
+            print(f"场景生成失败，改用说明摘录：{name}：{exc}", file=sys.stderr)
+    if not source:
+        return ""
+    return tidy_scenario(translate_to_zh(source))
+
+
 def localize_repos(repos: list[Repo]) -> list[Repo]:
     localized: list[Repo] = []
     for repo in repos:
+        readme = fetch_readme(repo.name)
+        source = scenario_source(readme, repo.description)
+        scenario = explain_scenario(repo.name, repo.description, source)
         description = translate_to_zh(repo.description) if repo.description else ""
-        localized.append(replace(repo, description=description))
+        if scenario and not adds_detail(scenario, description):
+            scenario = ""
+        localized.append(replace(repo, description=description, scenario=scenario))
     return localized
 
 
 def render_repo(index: int, repo: Repo) -> str:
     period = PERIOD_LABEL.get(repo.period, "本周")
     description = repo.description or "暂无介绍"
-    return "\n".join(
-        [
-            f"**第 {index} 名 · [{repo.name}]({repo.url})**",
-            f"总星数 {format_count(repo.stars)} · {period}新增 {format_count(repo.gained)}",
-            f"介绍：{description}",
-        ]
-    )
+    lines = [
+        f"**第 {index} 名 · [{repo.name}]({repo.url})**",
+        f"总星数 {format_count(repo.stars)} · {period}新增 {format_count(repo.gained)}",
+        f"介绍：{description}",
+    ]
+    if repo.scenario:
+        lines.append(f"场景：{repo.scenario}")
+    return "\n".join(lines)
 
 
 def render_messages(language: str, repos: list[Repo], when: datetime) -> list[str]:
