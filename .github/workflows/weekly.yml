@@ -1,0 +1,27 @@
+name: Weekly GitHub Trending
+
+on:
+  schedule:
+    # Monday 09:00 Asia/Shanghai (UTC+8)
+    - cron: "0 1 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Push weekly trending to WeCom
+        env:
+          WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+          LANGUAGES: ${{ vars.LANGUAGES }}
+          TOP_N: ${{ vars.TOP_N }}
+        run: python scripts/push_trending.py
